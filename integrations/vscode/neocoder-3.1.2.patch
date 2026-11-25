@@ -1,0 +1,222 @@
+--- a/lib/webview/chatViewProvider.js
++++ b/lib/webview/chatViewProvider.js
+@@ -496,6 +496,8 @@
+   return liveItemString(params?.itemId) || liveItemString(params?.item_id);
+ }
+ 
++const { failReview, reviewNotification, startCodeReview } = require("./reviewFollowup");
++
+ class NeoCoderChatViewProvider {
+   constructor(extensionUri, client, outputChannel, deps = {}) {
+     injectDeps(deps);
+@@ -919,14 +921,7 @@
+       return;
+     }
+     for (const entry of this.inflightReviewsByTurn.values()) {
+-      this.view?.webview.postMessage({
+-        type: "reviewItemUpdate",
+-        value: {
+-          requestedAt: entry.requestedAt,
+-          status: "error",
+-          errorMessage: reason,
+-        },
+-      });
++      failReview(this.view, entry, reason);
+     }
+     this.inflightReviewsByTurn.clear();
+   }
+@@ -2252,90 +2247,7 @@
+         // We wire requestedAt → turnId so the notification handler can
+         // forward the right card update to the webview.
+         case "requestCodeReview": {
+-          const requestedAt =
+-            typeof message.requestedAt === "number"
+-              ? message.requestedAt
+-              : Date.now();
+-          const instructions =
+-            typeof message.instructions === "string" &&
+-            message.instructions.trim()
+-              ? message.instructions.trim()
+-              : null;
+-          const threadId = this.currentStatusThreadId();
+-          if (!threadId) {
+-            this.view?.webview.postMessage({
+-              type: "reviewStarted",
+-              value: { requestedAt },
+-            });
+-            this.view?.webview.postMessage({
+-              type: "reviewItemUpdate",
+-              value: {
+-                requestedAt,
+-                status: "error",
+-                errorMessage:
+-                  "当前会话尚未启动 thread,无法发起审查(请先发送一条消息)",
+-              },
+-            });
+-            break;
+-          }
+-          const target = instructions
+-            ? { type: "custom", instructions }
+-            : { type: "uncommittedChanges" };
+-          try {
+-            const response = await this.client.request("review/start", {
+-              threadId,
+-              target,
+-              delivery: "inline",
+-            });
+-            const turnId =
+-              typeof response?.turn?.id === "string" ? response.turn.id : null;
+-            const reviewThreadId =
+-              typeof response?.reviewThreadId === "string"
+-                ? response.reviewThreadId
+-                : threadId;
+-            if (turnId) {
+-              this.inflightReviewsByTurn.set(turnId, {
+-                requestedAt,
+-                threadId,
+-              });
+-            }
+-            this.view?.webview.postMessage({
+-              type: "reviewStarted",
+-              value: {
+-                requestedAt,
+-                reviewThreadId,
+-                hint: instructions
+-                  ? `审查中: ${instructions}`
+-                  : "正在审查未提交的变更…",
+-              },
+-            });
+-          } catch (error) {
+-            const detail =
+-              error instanceof Error
+-                ? error.message
+-                : typeof error === "string"
+-                  ? error
+-                  : "审查请求失败";
+-            const friendly =
+-              error && error.code === -32601
+-                ? "当前 codex server 不支持 /review(需升级 codex)"
+-                : detail;
+-            this.outputChannel.appendLine(
+-              `${LOG_PREFIX} review/start failed: ${detail}`,
+-            );
+-            this.view?.webview.postMessage({
+-              type: "reviewStarted",
+-              value: { requestedAt },
+-            });
+-            this.view?.webview.postMessage({
+-              type: "reviewItemUpdate",
+-              value: {
+-                requestedAt,
+-                status: "error",
+-                errorMessage: friendly,
+-              },
+-            });
+-          }
++          await this.requestCodeReview(message);
+           break;
+         }
+         case "uploadFeedback": {
+@@ -7588,7 +7500,12 @@
+     }, 1000);
+   }
+ 
++  requestCodeReview(message) {
++    return startCodeReview(this, message);
++  }
++
+   handleAppServerStatusNotification(message) {
++    if (message) reviewNotification(this, message);
+     const method = message?.method;
+     const params = message?.params || {};
+     // V3-T3 /mcp panel — forward MCP lifecycle + oauth-completion notifications
+@@ -7806,28 +7723,6 @@
+           this.compactSafetyTimer = null;
+         }
+         this.setContextActionNotice("Compact 失败: 服务端错误");
+-      }
+-      // V2-T4 /review: if the failing turn matches an inflight review, flip
+-      // the loading card to error so the user sees a definitive end state
+-      // instead of an indefinite spinner.
+-      if (
+-        typeof params.turnId === "string" &&
+-        this.inflightReviewsByTurn?.has(params.turnId)
+-      ) {
+-        const inflight = this.inflightReviewsByTurn.get(params.turnId);
+-        this.inflightReviewsByTurn.delete(params.turnId);
+-        const errorMessage =
+-          (params.error && typeof params.error.message === "string"
+-            ? params.error.message
+-            : null) || "审查 turn 失败";
+-        this.view?.webview.postMessage({
+-          type: "reviewItemUpdate",
+-          value: {
+-            requestedAt: inflight.requestedAt,
+-            status: "error",
+-            errorMessage,
+-          },
+-        });
+       }
+       this.postState();
+       return;
+@@ -7944,34 +7839,6 @@
+         }
+         this.scheduleCompactIdleClear();
+         this.postState();
+-      }
+-      // V2-T4 /review: server emits ItemStarted+ItemCompleted for both
+-      // EnteredReviewMode and ExitedReviewMode (bespoke_event_handling.rs
+-      // :1500/:1571), so we listen only on item/completed for the exit event
+-      // and rely on params.item.id == review turnId to look up the inflight
+-      // request. Late-arriving notifications (user dismissed the card) are
+-      // silently dropped.
+-      if (params?.item?.type === "exitedReviewMode") {
+-        const turnId =
+-          typeof params.turnId === "string"
+-            ? params.turnId
+-            : typeof params.item.id === "string"
+-              ? params.item.id
+-              : null;
+-        if (turnId && this.inflightReviewsByTurn?.has(turnId)) {
+-          const inflight = this.inflightReviewsByTurn.get(turnId);
+-          this.inflightReviewsByTurn.delete(turnId);
+-          const reviewText =
+-            typeof params.item.review === "string" ? params.item.review : "";
+-          this.view?.webview.postMessage({
+-            type: "reviewItemUpdate",
+-            value: {
+-              requestedAt: inflight.requestedAt,
+-              status: "success",
+-              reviewText,
+-            },
+-          });
+-        }
+       }
+       // V4-T2 /plan: ThreadItem::Plan completes with the final markdown text.
+       // Forward to the webview so the PlanCard merges `text` into the entry
+--- a/lib/appServerClient.js
++++ b/lib/appServerClient.js
+@@ -894,6 +894,23 @@
+         )
+       );
+     }
++    // The paired 3.1.2 daemon reads the existing scoped NeoFlow session through
++    // the helper bundled beside it. The newer facade's helper needs its own
++    // launcher arguments, which this daemon does not supply.
++    const authCommand = 'model_providers.neoflow.auth.command';
++    const legacyHelper = this.launch?.command
++      ? path.join(path.dirname(this.launch.command), 'neocoder-auth-token.exe')
++      : null;
++    if (
++      process.platform === 'win32' &&
++      this.initializeResult?.compatibility?.daemonVersion === '3.1.2' &&
++      (method === 'thread/start' || method === 'thread/resume') &&
++      (!params?.modelProvider || params.modelProvider === 'neoflow') &&
++      legacyHelper && fs.existsSync(legacyHelper) &&
++      !Object.hasOwn(params?.config || {}, authCommand)
++    ) {
++      params = { ...params, config: { ...params?.config, [authCommand]: legacyHelper } };
++    }
+     return this.transport.request(method, params, options);
+   }
+ 

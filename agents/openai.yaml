@@ -1,0 +1,3 @@
+interface:
+  display_name: "neo-code-review"
+  short_description: "保留原代码评审并按公司规则追加取证和试算提交前参考分"
